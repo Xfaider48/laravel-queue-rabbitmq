@@ -4,6 +4,9 @@ namespace VladimirYuldashev\LaravelQueueRabbitMQ;
 
 use Exception;
 use Illuminate\Container\Container;
+use Illuminate\Contracts\Debug\ExceptionHandler;
+use Illuminate\Contracts\Events\Dispatcher;
+use Illuminate\Contracts\Queue\Factory as QueueManager;
 use Illuminate\Queue\Worker;
 use Illuminate\Queue\WorkerOptions;
 use PhpAmqpLib\Channel\AMQPChannel;
@@ -29,11 +32,26 @@ class Consumer extends Worker
     /** @var int */
     protected $prefetchCount;
 
+    /** @var bool  */
+    protected $blocking = false;
+
+    /** @var bool */
+    protected $asyncSignalsSupported;
+
     /** @var AMQPChannel */
     protected $channel;
 
     /** @var bool */
     protected $gotJob = false;
+
+    /**
+     * @inheritDoc
+     */
+    public function __construct(QueueManager $manager, Dispatcher $events, ExceptionHandler $exceptions, callable $isDownForMaintenance)
+    {
+        parent::__construct($manager, $events, $exceptions, $isDownForMaintenance);
+        $this->asyncSignalsSupported = $this->supportsAsyncSignals();
+    }
 
     public function setContainer(Container $value): void
     {
@@ -60,6 +78,11 @@ class Consumer extends Worker
         $this->prefetchCount = $value;
     }
 
+    public function setBlocking(bool $value): void
+    {
+        $this->blocking = $value;
+    }
+
     /**
      * Listen to the given queue in a loop.
      *
@@ -71,7 +94,7 @@ class Consumer extends Worker
      */
     public function daemon($connectionName, $queue, WorkerOptions $options)
     {
-        if ($this->supportsAsyncSignals()) {
+        if ($this->asyncSignalsSupported) {
             $this->listenForSignals();
         }
 
@@ -94,70 +117,86 @@ class Consumer extends Worker
             $arguments['priority'] = ['I', $this->maxPriority];
         }
 
-        $this->channel->basic_consume(
-            $queue,
-            $this->consumerTag,
-            false,
-            false,
-            false,
-            false,
-            function (AMQPMessage $message) use ($connection, $options, $connectionName, $queue, $jobClass, &$jobsProcessed): void {
-                $job = new $jobClass(
-                    $this->container,
-                    $connection,
-                    $message,
-                    $connectionName,
-                    $queue
-                );
-
-                if ($this->supportsAsyncSignals()) {
-                    $this->registerTimeoutHandler($job, $options);
+        while (true) {
+            if ($this->blocking && ! $this->daemonShouldRun($options, $connectionName, $queue)) {
+                if ($this->asyncSignalsSupported) {
+                    pcntl_signal_dispatch();
                 }
 
-                $this->runJob($job, $connectionName, $options);
-
-                if ($this->supportsAsyncSignals()) {
-                    $this->resetTimeoutHandler();
-                }
-            },
-            null,
-            $arguments
-        );
-
-        while ($this->channel->is_consuming()) {
-            // Before reserving any jobs, we will make sure this queue is not paused and
-            // if it is we will just pause this worker for a given amount of time and
-            // make sure we do not need to kill this worker process off completely.
-            if (! $this->daemonShouldRun($options, $connectionName, $queue)) {
                 $this->pauseWorker($options, $lastRestart);
 
                 continue;
             }
 
-            // If the daemon should run (not in maintenance mode, etc.), then we can wait for a job.
-            try {
-                $this->channel->wait(null, true, (int) $options->timeout);
-            } catch (AMQPRuntimeException $exception) {
-                $this->exceptions->report($exception);
+            $this->channel->basic_consume(
+                $queue,
+                $this->consumerTag,
+                false,
+                false,
+                false,
+                false,
+                function (AMQPMessage $message) use ($connection, $options, $connectionName, $queue, $jobClass, &$jobsProcessed): void {
+                    $job = new $jobClass(
+                        $this->container,
+                        $connection,
+                        $message,
+                        $connectionName,
+                        $queue
+                    );
 
-                $this->kill(1);
-            } catch (Exception | Throwable $exception) {
-                $this->exceptions->report($exception);
+                    if ($this->supportsAsyncSignals()) {
+                        $this->registerTimeoutHandler($job, $options);
+                    }
 
-                $this->stopWorkerIfLostConnection($exception);
+                    $this->runJob($job, $connectionName, $options);
+
+                    if ($this->supportsAsyncSignals()) {
+                        $this->resetTimeoutHandler();
+                    }
+                },
+                null,
+                $arguments
+            );
+
+            while ($this->channel->is_consuming()) {
+                // Before reserving any jobs, we will make sure this queue is not paused and
+                // if it is we will just pause this worker for a given amount of time and
+                // make sure we do not need to kill this worker process off completely.
+                if (! $this->blocking && ! $this->daemonShouldRun($options, $connectionName, $queue)) {
+                    $this->pauseWorker($options, $lastRestart);
+
+                    continue;
+                }
+
+                // If the daemon should run (not in maintenance mode, etc.), then we can wait for a job.
+                try {
+                    $this->channel->wait(null, ! $this->blocking);
+                } catch (AMQPRuntimeException $exception) {
+                    $this->exceptions->report($exception);
+
+                    $this->kill(1);
+                } catch (Exception | Throwable $exception) {
+                    $this->exceptions->report($exception);
+
+                    $this->stopWorkerIfLostConnection($exception);
+                }
+
+                // If no job is got off the queue, we will need to sleep the worker.
+                if (! $this->blocking && ! $this->gotJob) {
+                    $this->sleep($options->sleep);
+                }
+
+                // Finally, we will check to see if we have exceeded our memory limits or if
+                // the queue should restart based on other indications. If so, we'll stop
+                // this worker and let whatever is "monitoring" it restart the process.
+                $this->stopIfNecessary($options, $lastRestart, $this->gotJob ? true : null);
+
+                $this->gotJob = false;
             }
 
-            // If no job is got off the queue, we will need to sleep the worker.
-            if (! $this->gotJob) {
-                $this->sleep($options->sleep);
+            if (! $this->blocking) {
+                break;
             }
-
-            // Finally, we will check to see if we have exceeded our memory limits or if
-            // the queue should restart based on other indications. If so, we'll stop
-            // this worker and let whatever is "monitoring" it restart the process.
-            $this->stopIfNecessary($options, $lastRestart, $this->gotJob ? true : null);
-
-            $this->gotJob = false;
         }
     }
 
@@ -187,5 +226,36 @@ class Consumer extends Worker
         $this->channel->basic_cancel($this->consumerTag, false, true);
 
         parent::stop($status);
+    }
+
+    /**
+     * @inheritDoc
+     */
+    protected function listenForSignals()
+    {
+        if (! $this->blocking) {
+            parent::listenForSignals();
+            return;
+        }
+
+        // Support pause/exit for blocking mode
+        pcntl_async_signals(true);
+        pcntl_signal(SIGHUP, function () {
+            $this->shouldQuit = true;
+            $this->channel->close();
+        });
+        pcntl_signal(SIGTERM, function () {
+            $this->shouldQuit = true;
+            $this->channel->close();
+        });
+
+        pcntl_signal(SIGUSR2, function () {
+            $this->paused = true;
+            $this->channel->basic_cancel($this->consumerTag);
+        });
+
+        pcntl_signal(SIGCONT, function () {
+            $this->paused = false;
+        });
     }
 }

@@ -4,10 +4,10 @@ namespace VladimirYuldashev\LaravelQueueRabbitMQ\Horizon;
 
 use Illuminate\Contracts\Container\BindingResolutionException;
 use Illuminate\Contracts\Events\Dispatcher;
+use Illuminate\Support\Str;
 use Laravel\Horizon\Events\JobDeleted;
 use Laravel\Horizon\Events\JobPushed;
 use Laravel\Horizon\Events\JobReserved;
-use Laravel\Horizon\JobId;
 use Laravel\Horizon\JobPayload;
 use PhpAmqpLib\Exception\AMQPProtocolChannelException;
 use VladimirYuldashev\LaravelQueueRabbitMQ\Queue\Jobs\RabbitMQJob;
@@ -74,7 +74,7 @@ class RabbitMQQueue extends BaseRabbitMQQueue
     public function pop($queue = null)
     {
         return tap(parent::pop($queue), function ($result) use ($queue): void {
-            if ($result instanceof RabbitMQJob) {
+            if (is_a($result, RabbitMQJob::class, true)) {
                 $this->event($this->getQueue($queue), new JobReserved($result->getRawBody()));
             }
         });
@@ -125,6 +125,6 @@ class RabbitMQQueue extends BaseRabbitMQQueue
      */
     protected function getRandomId(): string
     {
-        return JobId::generate();
+        return Str::uuid();
     }
 }

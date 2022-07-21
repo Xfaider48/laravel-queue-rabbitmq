@@ -4,15 +4,12 @@ namespace VladimirYuldashev\LaravelQueueRabbitMQ;
 
 use Exception;
 use Illuminate\Container\Container;
-use Illuminate\Contracts\Queue\Job;
 use Illuminate\Queue\Worker;
 use Illuminate\Queue\WorkerOptions;
 use PhpAmqpLib\Channel\AMQPChannel;
 use PhpAmqpLib\Exception\AMQPRuntimeException;
 use PhpAmqpLib\Message\AMQPMessage;
-use Symfony\Component\Debug\Exception\FatalThrowableError;
 use Throwable;
-use VladimirYuldashev\LaravelQueueRabbitMQ\Queue\Jobs\RabbitMQJob;
 use VladimirYuldashev\LaravelQueueRabbitMQ\Queue\RabbitMQQueue;
 
 class Consumer extends Worker
@@ -25,6 +22,9 @@ class Consumer extends Worker
 
     /** @var int */
     protected $prefetchSize;
+
+    /** @var int */
+    protected $maxPriority;
 
     /** @var int */
     protected $prefetchCount;
@@ -45,6 +45,11 @@ class Consumer extends Worker
         $this->consumerTag = $value;
     }
 
+    public function setMaxPriority(int $value): void
+    {
+        $this->maxPriority = $value;
+    }
+
     public function setPrefetchSize(int $value): void
     {
         $this->prefetchSize = $value;
@@ -55,7 +60,16 @@ class Consumer extends Worker
         $this->prefetchCount = $value;
     }
 
-    public function daemon($connectionName, $queue, WorkerOptions $options): void
+    /**
+     * Listen to the given queue in a loop.
+     *
+     * @param string $connectionName
+     * @param string $queue
+     * @param WorkerOptions $options
+     * @return int
+     * @throws Throwable
+     */
+    public function daemon($connectionName, $queue, WorkerOptions $options)
     {
         if ($this->supportsAsyncSignals()) {
             $this->listenForSignals();
@@ -74,6 +88,12 @@ class Consumer extends Worker
             null
         );
 
+        $jobClass = $connection->getJobClass();
+        $arguments = [];
+        if ($this->maxPriority) {
+            $arguments['priority'] = ['I', $this->maxPriority];
+        }
+
         $this->channel->basic_consume(
             $queue,
             $this->consumerTag,
@@ -81,10 +101,8 @@ class Consumer extends Worker
             false,
             false,
             false,
-            function (AMQPMessage $message) use ($connection, $options, $connectionName, $queue): void {
-                $this->gotJob = true;
-
-                $job = new RabbitMQJob(
+            function (AMQPMessage $message) use ($connection, $options, $connectionName, $queue, $jobClass, &$jobsProcessed): void {
+                $job = new $jobClass(
                     $this->container,
                     $connection,
                     $message,
@@ -101,7 +119,9 @@ class Consumer extends Worker
                 if ($this->supportsAsyncSignals()) {
                     $this->resetTimeoutHandler();
                 }
-            }
+            },
+            null,
+            $arguments
         );
 
         while ($this->channel->is_consuming()) {
@@ -110,6 +130,7 @@ class Consumer extends Worker
             // make sure we do not need to kill this worker process off completely.
             if (! $this->daemonShouldRun($options, $connectionName, $queue)) {
                 $this->pauseWorker($options, $lastRestart);
+
                 continue;
             }
 
@@ -120,12 +141,8 @@ class Consumer extends Worker
                 $this->exceptions->report($exception);
 
                 $this->kill(1);
-            } catch (Exception $exception) {
+            } catch (Exception | Throwable $exception) {
                 $this->exceptions->report($exception);
-
-                $this->stopWorkerIfLostConnection($exception);
-            } catch (Throwable $exception) {
-                $this->exceptions->report($exception = new FatalThrowableError($exception));
 
                 $this->stopWorkerIfLostConnection($exception);
             }

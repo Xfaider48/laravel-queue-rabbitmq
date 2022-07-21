@@ -2,7 +2,10 @@
 
 namespace VladimirYuldashev\LaravelQueueRabbitMQ\Tests\Functional;
 
+use Exception;
 use PhpAmqpLib\Connection\AMQPLazyConnection;
+use ReflectionClass;
+use ReflectionException;
 use VladimirYuldashev\LaravelQueueRabbitMQ\Tests\TestCase as BaseTestCase;
 
 abstract class TestCase extends BaseTestCase
@@ -110,6 +113,45 @@ abstract class TestCase extends BaseTestCase
                     'reroute_failed' => '',
                     'failed_exchange' => '',
                     'failed_routing_key' => '',
+                    'quorum' => '',
+                ],
+            ],
+
+            'worker' => 'default',
+
+        ]);
+        $app['config']->set('queue.connections.rabbitmq-with-quorum-options', [
+            'driver' => 'rabbitmq',
+            'queue' => 'order',
+            'connection' => AMQPLazyConnection::class,
+
+            'hosts' => [
+                [
+                    'host' => getenv('HOST'),
+                    'port' => getenv('PORT'),
+                    'vhost' => '/',
+                    'user' => 'guest',
+                    'password' => 'guest',
+                ],
+            ],
+
+            'options' => [
+                'ssl_options' => [
+                    'cafile' => null,
+                    'local_cert' => null,
+                    'local_key' => null,
+                    'verify_peer' => true,
+                    'passphrase' => null,
+                ],
+
+                'queue' => [
+                    'exchange' => 'application-x',
+                    'exchange_type' => 'topic',
+                    'exchange_routing_key' => 'process.%s',
+                    'reroute_failed' => true,
+                    'failed_exchange' => 'failed-exchange',
+                    'failed_routing_key' => 'application-x.%s.failed',
+                    'quorum' => true,
                 ],
             ],
 
@@ -123,15 +165,15 @@ abstract class TestCase extends BaseTestCase
      * @param string $method
      * @param array $parameters
      * @return mixed
-     * @throws \Exception
+     * @throws Exception
      */
     protected function callMethod($object, string $method, array $parameters = [])
     {
         try {
             $className = get_class($object);
-            $reflection = new \ReflectionClass($className);
-        } catch (\ReflectionException $e) {
-            throw new \Exception($e->getMessage());
+            $reflection = new ReflectionClass($className);
+        } catch (ReflectionException $e) {
+            throw new Exception($e->getMessage());
         }
 
         $method = $reflection->getMethod($method);
